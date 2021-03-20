@@ -1,0 +1,11 @@
+
+*.jpg
+covid.npy
+covid_model.pt
+Creating a custom Dataset and DataLoader - Demonstration Notebook.ipynb
+health.npy
+healthy_model.pt
+Small_Project_instructions.pdf
+4 layer.txt
+.ipynb_checkpoints
+__pycache__
