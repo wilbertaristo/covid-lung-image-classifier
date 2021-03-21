@@ -17,9 +17,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
-from torch.optim.lr_scheduler import StepLR
 
 # Define function to save checkpoint
+
 
 class Net(nn.Module):
     def __init__(self, layers, model_name, with_dropout=True):
@@ -64,9 +64,12 @@ class Net(nn.Module):
         return output
 
 # Define function to load model
+
+
 def load_model(path):
     cp = torch.load(path)
     return cp
+
 
 def test_model(model, testloader, device='cuda'):
     model.to(device)
@@ -90,8 +93,8 @@ def init_weights(m):
         torch.nn.init.kaiming_uniform_(m.weight)
         m.bias.data.fill_(0.01)
 
-        
-def run_model(n_hidden, n_epoch, labelsdict, lr, device, model_name, trainloader, validloader, train_data, layers, covid = False):
+
+def run_model(n_hidden, n_epoch, labelsdict, lr, device, model_name, trainloader, validloader, train_data, layers, covid=False):
     model = Net(layers=layers, model_name=model_name, with_dropout=(not covid))
     model.to(device)
     model.apply(init_weights)
@@ -99,8 +102,6 @@ def run_model(n_hidden, n_epoch, labelsdict, lr, device, model_name, trainloader
 
     # optimiser is using Adam for SGD and the learning rate is lr that will be controlled by a learning rate scheduler
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    if covid:
-        scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
     training_loss = []
     validation_loss = []
     pending_loss = []
@@ -110,15 +111,17 @@ def run_model(n_hidden, n_epoch, labelsdict, lr, device, model_name, trainloader
     save_model = True
     min_epoch = 3
     for epoch in range(1, n_epoch + 1):
-        train_loss, total_count, model = train(model, device, trainloader, optimizer, epoch, save_model)
+        train_loss, total_count, model = train(
+            model, device, trainloader, optimizer, epoch, save_model)
         utc_now = pytz.utc.localize(datetime.datetime.utcnow())
         pst_now = utc_now.astimezone(pytz.timezone('Asia/Singapore'))
         time = pst_now.strftime("%Y-%m-%d %H:%M:%S")
-        print('\nEpoch {} Time: {} Training set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(epoch, time, train_loss, total_count, len(trainloader.dataset), 100. * total_count / len(trainloader.dataset)))
+        print('\nEpoch {} Time: {} Training set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(epoch,
+                                                                                                           time, train_loss, total_count, len(trainloader.dataset), 100. * total_count / len(trainloader.dataset)))
         training_loss.append(train_loss)
         val_loss = evaluate(model, device, validloader, epoch)
         current_loss = val_loss
-        
+
         # ==== Implement Early Stoppage if Overfitting ====
         if epoch > min_epoch:
             if current_loss < previous_loss:
@@ -144,15 +147,14 @@ def run_model(n_hidden, n_epoch, labelsdict, lr, device, model_name, trainloader
             validation_loss.append(current_loss)
             print("Saving Model...")
             torch.save(model, "{}_model.pt".format(model.model_name))
-        # ==================================================   
-            
-        if covid:
-            scheduler.step()
-    
+        # ==================================================
+
     save('{}.npy'.format('covid' if covid else 'health'), validation_loss)
-    save('{}_train_loss.npy'.format('covid' if covid else 'health'), training_loss[:len(validation_loss)])
+    save('{}_train_loss.npy'.format('covid' if covid else 'health'),
+         training_loss[:len(validation_loss)])
 
     return model
+
 
 def evaluate(model, device, validloader, epoch):
     model.eval()
@@ -173,6 +175,23 @@ def evaluate(model, device, validloader, epoch):
     print('\nEpoch {} Time {} Validation set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
         epoch, time, val_loss, valcorrect, len(validloader.dataset), 100. * valcorrect / len(validloader.dataset)))
     return val_loss
+
+
+def evaluate_without_training(model, device, validloader):
+    model.eval()
+    val_loss = 0
+    valcorrect = 0
+    with torch.no_grad():
+        for data2, target2 in validloader:
+            data2, target2 = data2.to(device), target2.to(device)
+            output2 = model(data2)
+            val_loss += F.cross_entropy(
+                output2, target2, reduction='sum').item()
+            pred2 = output2.argmax(dim=1, keepdim=True)
+            valcorrect += pred2.eq(target2.view_as(pred2)).sum().item()
+    val_loss /= len(validloader.dataset)
+    print('\nValidation set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
+        val_loss, valcorrect, len(validloader.dataset), 100. * valcorrect / len(validloader.dataset)))
 
 # function to train the model
 
@@ -207,4 +226,3 @@ def train(model, device, train_loader, optimizer, epoch, save_model):
                 100. * batch_idx / len(train_loader), loss.item()))
     lossout = total_loss / len(train_loader)
     return lossout, total_count, model
-        
