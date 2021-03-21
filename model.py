@@ -1,6 +1,8 @@
 import numpy as np
 import time
 from collections import OrderedDict
+import datetime
+import pytz
 
 import torch
 from torch import nn
@@ -19,40 +21,25 @@ from torch.optim.lr_scheduler import StepLR
 
 # Define function to save checkpoint
 
-
-def save_checkpoint(model, path):
-    checkpoint = {'c_input': model.classifier.n_in,
-                  'c_hidden': model.classifier.n_hidden,
-                  'c_out': model.classifier.n_out,
-                  'labelsdict': model.classifier.labelsdict,
-                  'c_lr': model.classifier.lr,
-                  'state_dict': model.state_dict(),
-                  'c_state_dict': model.classifier.state_dict(),
-                  'opti_state_dict': model.classifier.optimizer_state_dict,
-                  'model_name': model.classifier.model_name,
-                  'class_to_idx': model.classifier.class_to_idx
-                  }
-    torch.save(checkpoint, path)
-
-
 class Net(nn.Module):
-    def __init__(self, layers, with_dropout=True):
+    def __init__(self, layers, model_name, with_dropout=True):
         super(Net, self).__init__()
         self.with_dropout = with_dropout
         self.conv = {}
         self.batchnorm = {}
+        self.model_name = model_name
         for i in range(layers):
             if i == 0:
-                self.conv[i] = nn.Conv2d(1, 32, 3, 1).to('cuda')
-                self.batchnorm[i] = nn.BatchNorm2D(32).to('cuda')
+                self.conv[i] = nn.Conv2d(1, 16, 3, 1).to('cuda')
+                self.batchnorm[i] = nn.BatchNorm2d(16).to('cuda')
             else:
                 self.conv[i] = nn.Conv2d(
-                    32*(2**(i-1)), 32*(2**i), 3, 1).to('cuda')
-                self.batchnorm[i] = nn.BatchNorm2D(32*(2**i)).to('cuda')
+                    16*(2**(i-1)), 16*(2**i), 3, 1).to('cuda')
+                self.batchnorm[i] = nn.BatchNorm2d(16*(2**i)).to('cuda')
         if with_dropout:
             self.dropout1 = nn.Dropout(0.25)
             self.dropout2 = nn.Dropout(0.5)
-        fc_lay = int(32 * (2 ** (layers-1)) * (((150-(layers * 2))/2)**2))
+        fc_lay = int(16 * (2 ** (layers-1)) * (((150-(layers * 2))/2)**2))
         self.fc1 = nn.Linear(fc_lay, 128)
         self.fc2 = nn.Linear(128, 32)
         self.classifier = nn.Linear(32, 2)
@@ -76,35 +63,10 @@ class Net(nn.Module):
         output = F.log_softmax(x, dim=1)
         return output
 
-
 # Define function to load model
 def load_model(path):
     cp = torch.load(path)
-
-    # Import pre-trained NN model
-    model = getattr(models, cp['model_name'])(pretrained=True)
-
-    # Freeze parameters that we don't need to re-train
-    for param in model.parameters():
-        param.requires_grad = False
-
-    # Make classifier
-    model.classifier = NN_Classifier(input_size=cp['c_input'], output_size=cp['c_out'],
-                                     hidden_layers=cp['c_hidden'])
-
-    # Add model info
-    model.classifier.n_in = cp['c_input']
-    model.classifier.n_hidden = cp['c_hidden']
-    model.classifier.n_out = cp['c_out']
-    model.classifier.labelsdict = cp['labelsdict']
-    model.classifier.lr = cp['c_lr']
-    model.classifier.optimizer_state_dict = cp['opti_state_dict']
-    model.classifier.model_name = cp['model_name']
-    model.classifier.class_to_idx = cp['class_to_idx']
-    model.load_state_dict(cp['state_dict'])
-
-    return model
-
+    return cp
 
 def test_model(model, testloader, device='cuda'):
     model.to(device)
@@ -125,52 +87,72 @@ def test_model(model, testloader, device='cuda'):
 
 def init_weights(m):
     if type(m) in [nn.Linear, nn.Conv2d]:
-        torch.nn.init.xavier_uniform_(m.weight)
+        torch.nn.init.kaiming_uniform_(m.weight)
         m.bias.data.fill_(0.01)
 
-
-def covid_model(n_hidden, n_epoch, labelsdict, lr, device, model_name, trainloader, validloader, train_data, layers):
-    model = Net(layers=layers, with_dropout=False)
-
+        
+def run_model(n_hidden, n_epoch, labelsdict, lr, device, model_name, trainloader, validloader, train_data, layers, covid = False):
+    model = Net(layers=layers, model_name=model_name, with_dropout=(not covid))
     model.to(device)
     model.apply(init_weights)
     print(model)
 
     # optimiser is using Adam for SGD and the learning rate is lr that will be controlled by a learning rate scheduler
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
-    loss_acc = []
+    if covid:
+        scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
+    training_loss = []
+    validation_loss = []
+    pending_loss = []
+    previous_loss = 10 ** 99
+    current_loss = 10 ** 99
+    consecutive_increase = 0
+    save_model = True
+    min_epoch = 3
     for epoch in range(1, n_epoch + 1):
-        train(model, device, trainloader, optimizer, epoch)
+        train_loss, total_count, model = train(model, device, trainloader, optimizer, epoch, save_model)
+        utc_now = pytz.utc.localize(datetime.datetime.utcnow())
+        pst_now = utc_now.astimezone(pytz.timezone('Asia/Singapore'))
+        time = pst_now.strftime("%Y-%m-%d %H:%M:%S")
+        print('\nEpoch {} Time: {} Training set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(epoch, time, train_loss, total_count, len(trainloader.dataset), 100. * total_count / len(trainloader.dataset)))
+        training_loss.append(train_loss)
         val_loss = evaluate(model, device, validloader, epoch)
-        loss_acc.append(val_loss)
-        scheduler.step()
-    torch.save(model.state_dict(), "covid_model.pt")
-    save('covid.npy', loss_acc)
+        current_loss = val_loss
+        
+        # ==== Implement Early Stoppage if Overfitting ====
+        if epoch > min_epoch:
+            if current_loss < previous_loss:
+                previous_loss = current_loss
+                consecutive_increase = 0
+                validation_loss += pending_loss
+                validation_loss.append(current_loss)
+                pending_loss = []
+                save_model = True
+            else:
+                consecutive_increase += 1
+                pending_loss.append(current_loss)
+                save_model = False
+
+            if save_model:
+                print("Saving Model...")
+                torch.save(model, "{}_model.pt".format(model.model_name))
+
+            if consecutive_increase == 3:
+                break
+        else:
+            previous_loss = current_loss
+            validation_loss.append(current_loss)
+            print("Saving Model...")
+            torch.save(model, "{}_model.pt".format(model.model_name))
+        # ==================================================   
+            
+        if covid:
+            scheduler.step()
+    
+    save('{}.npy'.format('covid' if covid else 'health'), validation_loss)
+    save('{}_train_loss.npy'.format('covid' if covid else 'health'), training_loss[:len(validation_loss)])
 
     return model
-
-
-def healthy_model(n_hidden, n_epoch, labelsdict, lr, device, model_name, trainloader, validloader, train_data, layers):
-    model = Net(layers=layers)
-    model.to(device)
-    model.apply(init_weights)
-    print(model)
-
-    # optimiser is using Adam for SGD and the learning rate is lr that will be controlled by a learning rate scheduler
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
-    loss_acc = []
-    for epoch in range(1, n_epoch + 1):
-        train(model, device, trainloader, optimizer, epoch)
-        val_loss = evaluate(model, device, validloader, epoch)
-        loss_acc.append(val_loss)
-        scheduler.step()
-    torch.save(model.state_dict(), "healthy_model.pt")
-    save('health.npy', loss_acc)
-
-    return model
-
 
 def evaluate(model, device, validloader, epoch):
     model.eval()
@@ -180,23 +162,28 @@ def evaluate(model, device, validloader, epoch):
         for data2, target2 in validloader:
             data2, target2 = data2.to(device), target2.to(device)
             output2 = model(data2)
-            val_loss = F.cross_entropy(
+            val_loss += F.cross_entropy(
                 output2, target2, reduction='sum').item()
             pred2 = output2.argmax(dim=1, keepdim=True)
             valcorrect += pred2.eq(target2.view_as(pred2)).sum().item()
     val_loss /= len(validloader.dataset)
-    print('\nEpoch {} Validation set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
-        epoch, val_loss, valcorrect, len(validloader.dataset), 100. * valcorrect / len(validloader.dataset)))
+    utc_now = pytz.utc.localize(datetime.datetime.utcnow())
+    pst_now = utc_now.astimezone(pytz.timezone('Asia/Singapore'))
+    time = pst_now.strftime("%Y-%m-%d %H:%M:%S")
+    print('\nEpoch {} Time {} Validation set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
+        epoch, time, val_loss, valcorrect, len(validloader.dataset), 100. * valcorrect / len(validloader.dataset)))
     return val_loss
 
 # function to train the model
 
 
-def train(model, device, train_loader, optimizer, epoch):
+def train(model, device, train_loader, optimizer, epoch, save_model):
     print('model is training')
     # setting the model to training mode
     loss = 0
     correct_count = 0
+    total_loss = 0
+    total_count = 0
     model.train()
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
@@ -207,12 +194,17 @@ def train(model, device, train_loader, optimizer, epoch):
             if pred[j] == target[j]:
                 correct_count += 1
         loss = F.cross_entropy(output, target)
+        total_loss += loss.item()
         loss.backward()
         optimizer.step()
         accuracy = correct_count / len(target)
+        total_count += correct_count
         correct_count = 0
         if batch_idx % train_loader.batch_size == 0:
             print("Accuracy: {}".format(accuracy))
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(train_loader.dataset),
                 100. * batch_idx / len(train_loader), loss.item()))
+    lossout = total_loss / len(train_loader)
+    return lossout, total_count, model
+        
